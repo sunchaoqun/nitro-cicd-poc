@@ -1,0 +1,74 @@
+name: build-sign
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_ACCOUNT_ID: "889818959689"
+  AWS_REGION: us-west-2
+  ECR_REPO: nitro-cicd-poc
+  SIGNER_PROFILE: nitro_cicd_poc_release
+  BUILD_ROLE: nitro-cicd-poc-build
+
+permissions:
+  id-token: write
+  contents: read
+  attestations: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build (PR 只构建，不推送)
+        if: github.event_name == 'pull_request'
+        run: docker build --build-arg GIT_SHA="$GITHUB_SHA" -t local/test .
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name == 'push'
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/${{ env.BUILD_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        if: github.event_name == 'push'
+        id: ecr
+
+      - name: Build and push (tag = commit SHA)
+        if: github.event_name == 'push'
+        id: push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/${ECR_REPO}:${GITHUB_SHA}
+          docker build --build-arg GIT_SHA="$GITHUB_SHA" -t "$IMAGE" .
+          docker push "$IMAGE"
+          DIGEST=$(aws ecr describe-images --repository-name "$ECR_REPO" \
+            --image-ids imageTag="$GITHUB_SHA" --query 'imageDetails[0].imageDigest' --output text)
+          echo "ref=${{ steps.ecr.outputs.registry }}/${ECR_REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Notation + AWS Signer plugin
+        if: github.event_name == 'push'
+        run: |
+          curl -fsSLO https://d2hvyiie56hcat.cloudfront.net/linux/amd64/installer/deb/latest/aws-signer-notation-cli_amd64.deb
+          sudo dpkg -i aws-signer-notation-cli_amd64.deb
+          notation version
+          notation plugin ls
+
+      - name: Sign with AWS Signer (by digest)
+        if: github.event_name == 'push'
+        run: |
+          notation sign "${{ steps.push.outputs.ref }}" \
+            --plugin com.amazonaws.signer.notation.plugin \
+            --id "arn:aws:signer:${AWS_REGION}:${AWS_ACCOUNT_ID}:/signing-profiles/${SIGNER_PROFILE}"
+
+      - name: Build provenance attestation
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: false
